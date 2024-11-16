@@ -1,0 +1,174 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/ollama/ollama/api"
+	"github.com/qdrant/go-client/qdrant"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+const (
+	ollamaModel     = "llama3.2"
+	qdrantHost      = "localhost:6334"
+	collectionName  = "documents"
+	vectorDimension = 3072 // Ollama의 임베딩 차원에 맞게 조정
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Ollama 클라이언트 초기화
+	ollamaClient, err := api.ClientFromEnvironment()
+	if err != nil {
+		log.Fatalf("Ollama 클라이언트 생성 실패: %v", err)
+	}
+
+	// Qdrant 클라이언트 초기화
+	conn, err := grpc.Dial(qdrantHost, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Qdrant 연결 실패: %v", err)
+	}
+	defer conn.Close()
+	qdrantClient := qdrant.NewCollectionsClient(conn)
+	qdrantPointsClient := qdrant.NewPointsClient(conn)
+
+	// 컬렉션 생성 (이미 존재하지 않는 경우)
+	//deleteCollection(ctx, qdrantClient)
+
+	createCollection(ctx, qdrantClient)
+
+	// 문서 인덱싱
+	documents := []string{
+		"Golang은 바보임니다",
+		"Qdrant는 또라이입니다",
+		"RAG는 Retrieval-Augmented Generation의 약자로, 정보 검색과 텍스트 생성을 결합한 AI 기술입니다.",
+	}
+	indexDocuments(ctx, ollamaClient, qdrantPointsClient, documents)
+
+	// 사용자 쿼리 처리
+	query := "Golang에 대해 설명해주세요."
+	answer := processQuery(ctx, ollamaClient, qdrantPointsClient, query)
+	fmt.Printf("질문: %s\n답변: %s\n", query, answer)
+}
+
+func createCollection(ctx context.Context, client qdrant.CollectionsClient) {
+	_, err := client.Create(ctx, &qdrant.CreateCollection{
+		CollectionName: collectionName,
+		VectorsConfig: &qdrant.VectorsConfig{
+			Config: &qdrant.VectorsConfig_Params{
+				Params: &qdrant.VectorParams{
+					Size:     uint64(vectorDimension),
+					Distance: qdrant.Distance_Cosine,
+				},
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("컬렉션 생성 실패 (이미 존재할 수 있음): %v", err)
+	}
+}
+
+func indexDocuments(ctx context.Context, ollamaClient *api.Client, qdrantClient qdrant.PointsClient, documents []string) {
+	for i, doc := range documents {
+		// 임베딩 생성
+		resp, err := ollamaClient.Embeddings(ctx, &api.EmbeddingRequest{
+			Model:  ollamaModel,
+			Prompt: doc,
+		})
+		if err != nil {
+			log.Printf("문서 임베딩 실패: %v", err)
+			continue
+		}
+
+		// Qdrant에 벡터 삽입
+		_, err = qdrantClient.Upsert(ctx, &qdrant.UpsertPoints{
+			CollectionName: collectionName,
+			Points: []*qdrant.PointStruct{
+				{
+					Id: &qdrant.PointId{PointIdOptions: &qdrant.PointId_Num{Num: uint64(i)}},
+					Vectors: &qdrant.Vectors{
+						VectorsOptions: &qdrant.Vectors_Vector{
+							Vector: &qdrant.Vector{
+								Data: convertToFloat32(resp.Embedding),
+							},
+						},
+					},
+					Payload: map[string]*qdrant.Value{"text": {Kind: &qdrant.Value_StringValue{StringValue: doc}}},
+				},
+			},
+		})
+		if err != nil {
+			log.Printf("벡터 삽입 실패: %v", err)
+		}
+	}
+}
+
+func processQuery(ctx context.Context, ollamaClient *api.Client, qdrantClient qdrant.PointsClient, query string) string {
+	// 쿼리 임베딩
+	resp, err := ollamaClient.Embeddings(ctx, &api.EmbeddingRequest{
+		Model:  ollamaModel,
+		Prompt: query,
+	})
+	if err != nil {
+		log.Printf("쿼리 임베딩 실패: %v", err)
+		return "죄송합니다. 쿼리 처리 중 오류가 발생했습니다."
+	}
+
+	// 유사한 문서 검색
+	searchResp, err := qdrantClient.Search(ctx, &qdrant.SearchPoints{
+		CollectionName: collectionName,
+		Vector:         convertToFloat32(resp.Embedding),
+		Limit:          3,
+		WithPayload:    &qdrant.WithPayloadSelector{SelectorOptions: &qdrant.WithPayloadSelector_Enable{Enable: true}},
+	})
+	if err != nil {
+		log.Printf("유사 문서 검색 실패: %v", err)
+		return "죄송합니다. 관련 정보를 찾는 중 오류가 발생했습니다."
+	}
+
+	// 컨텍스트 구성
+	context := "다음 정보를 바탕으로 질문에 답하세요:\n"
+	for _, point := range searchResp.Result {
+		context += point.Payload["text"].GetStringValue() + "\n"
+	}
+	fmt.Println("createCollection", context)
+
+	// LLM에 질의
+	var answer string
+	err = ollamaClient.Generate(ctx, &api.GenerateRequest{
+		Model:  ollamaModel,
+		Prompt: context + "\n질문: " + query + "\n답변:",
+	}, func(response api.GenerateResponse) error {
+		answer += response.Response
+		return nil
+	})
+	if err != nil {
+		log.Printf("LLM 응답 생성 실패: %v", err)
+		return "죄송합니다. 답변을 생성하는 중 오류가 발생했습니다."
+	}
+
+	return answer
+}
+
+func deleteCollection(ctx context.Context, client qdrant.CollectionsClient) {
+	_, err := client.Delete(ctx, &qdrant.DeleteCollection{
+		CollectionName: collectionName,
+	})
+	if err != nil {
+		log.Printf("컬렉션 삭제 실패: %v", err)
+	} else {
+		log.Printf("컬렉션 '%s'가 성공적으로 삭제되었습니다.", collectionName)
+	}
+}
+
+func convertToFloat32(f64 []float64) []float32 {
+	f32 := make([]float32, len(f64))
+	for i, v := range f64 {
+		f32[i] = float32(v)
+	}
+	return f32
+}

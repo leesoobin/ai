@@ -1,0 +1,155 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/sashabaranov/go-openai"
+	"github.com/weaviate/weaviate-go-client/v4/weaviate"
+	"github.com/weaviate/weaviate-go-client/v4/weaviate/graphql"
+	"github.com/weaviate/weaviate/entities/models"
+)
+
+const (
+	weaviateHost    = "localhost:8080"
+	className       = "Sbb"
+	vectorDimension = 1536 // OpenAI의 임베딩 차원에 맞게 조정
+)
+
+func main() {
+	ctx := context.Background()
+
+	// OpenAI API 키 설정
+	openaiAPIKey := os.Getenv("OPENAI_API_KEY")
+	if openaiAPIKey == "" {
+		log.Fatal("OPENAI_API_KEY 환경 변수가 설정되지 않았습니다.")
+	}
+
+	// OpenAI 클라이언트 초기화
+	openaiClient := openai.NewClient(openaiAPIKey)
+
+	// Weaviate 클라이언트 초기화
+	weaviateClient, err := weaviate.NewClient(weaviate.Config{
+		Host:   weaviateHost,
+		Scheme: "http",
+	})
+	if err != nil {
+		log.Fatalf("Weaviate 연결 실패: %v", err)
+	}
+
+	// 사용자 쿼리 처리
+	query := "sb.lee의 서버접근권한 알려줘"
+	answer := processQuery(ctx, openaiClient, weaviateClient, query)
+	fmt.Printf("질문: %s\n답변: %s\n", query, answer)
+}
+
+func createClass(ctx context.Context, client *weaviate.Client) {
+	classObj := &models.Class{
+		Class: className,
+		Properties: []*models.Property{
+			{
+				Name:     "text",
+				DataType: []string{"text"},
+			},
+		},
+		VectorIndexType: "hnsw",
+	}
+
+	err := client.Schema().ClassCreator().WithClass(classObj).Do(ctx)
+	if err != nil {
+		log.Printf("클래스 생성 실패 (이미 존재할 수 있음): %v", err)
+	}
+}
+
+func indexDocuments(ctx context.Context, openaiClient *openai.Client, weaviateClient *weaviate.Client, documents []string) {
+	for _, doc := range documents {
+		// OpenAI를 사용하여 임베딩 생성
+		resp, err := openaiClient.CreateEmbeddings(ctx, openai.EmbeddingRequest{
+			Model: openai.AdaEmbeddingV2,
+			Input: []string{doc},
+		})
+		if err != nil {
+			log.Printf("문서 임베딩 실패: %v", err)
+			continue
+		}
+
+		// Weaviate에 벡터 삽입
+		_, err = weaviateClient.Data().Creator().
+			WithClassName(className).
+			WithProperties(map[string]interface{}{
+				"text": doc,
+			}).
+			WithVector(resp.Data[0].Embedding).
+			Do(ctx)
+
+		if err != nil {
+			log.Printf("벡터 삽입 실패: %v", err)
+		}
+	}
+}
+
+func processQuery(ctx context.Context, openaiClient *openai.Client, weaviateClient *weaviate.Client, query string) string {
+	// OpenAI를 사용하여 쿼리 임베딩
+	resp, err := openaiClient.CreateEmbeddings(ctx, openai.EmbeddingRequest{
+		Model: openai.AdaEmbeddingV2,
+		Input: []string{query},
+	})
+	if err != nil {
+		log.Printf("쿼리 임베딩 실패: %v", err)
+		return "죄송합니다. 쿼리 처리 중 오류가 발생했습니다."
+	}
+
+	// 유사한 문서 검색
+	nearVector := weaviateClient.GraphQL().NearVectorArgBuilder().
+		WithVector(resp.Data[0].Embedding)
+
+	result, err := weaviateClient.GraphQL().Get().
+		WithClassName(className).
+		WithFields(graphql.Field{Name: "text"}).
+		WithNearVector(nearVector).
+		WithLimit(3).
+		Do(ctx)
+
+	if err != nil {
+		log.Printf("유사 문서 검색 실패: %v", err)
+		return "죄송합니다. 관련 정보를 찾는 중 오류가 발생했습니다."
+	}
+
+	// 컨텍스트 구성
+	context := "다음 정보를 바탕으로 질문에 답하세요:\n"
+	if data, ok := result.Data["Get"].(map[string]interface{}); ok {
+		if documents, ok := data[className].([]interface{}); ok {
+			for _, doc := range documents {
+				if item, ok := doc.(map[string]interface{}); ok {
+					if text, ok := item["text"].(string); ok {
+						context += text + "\n"
+					}
+				}
+			}
+		}
+	}
+	fmt.Println("Context:", context)
+
+	// ChatGPT에 질의
+	chatResp, err := openaiClient.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: openai.GPT3Dot5Turbo,
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: "You are a helpful assistant that provides information about server access rights.",
+			},
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: context + "\n질문: " + query,
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("ChatGPT 응답 생성 실패: %v", err)
+		return "죄송합니다. 답변을 생성하는 중 오류가 발생했습니다."
+	}
+
+	return chatResp.Choices[0].Message.Content
+}
